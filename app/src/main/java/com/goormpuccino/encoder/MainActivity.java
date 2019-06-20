@@ -2,6 +2,7 @@ package com.goormpuccino.encoder;
 
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Point;
 import android.hardware.display.DisplayManager;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
@@ -26,6 +27,7 @@ import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
 import android.view.Surface;
+import android.view.WindowManager;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -46,6 +48,9 @@ public class MainActivity extends AppCompatActivity {
     private MediaProjection mMediaProjection;
     private static final int REQUEST_CODE_CAPTURE_PERM = 9797;
     private WritableByteChannel outChannel = null;
+    private WindowManager windowManager = null;
+    private int dispSize = 0;
+    private boolean restartEncoding = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -93,7 +98,7 @@ public class MainActivity extends AppCompatActivity {
             try {
                 Socket sock = new Socket();
                 sock.setTcpNoDelay(true);
-                sock.connect(new InetSocketAddress("192.168.1.45", 5567));
+                sock.connect(new InetSocketAddress("192.168.1.4", 5567));
                 sock.setTcpNoDelay(true);
                 OutputStream sockOut = sock.getOutputStream();
                 outChannel = Channels.newChannel(sockOut);
@@ -103,16 +108,19 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private int mmpCode = 0;
+    private Intent mmpData = null;
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
         if (REQUEST_CODE_CAPTURE_PERM == requestCode) {
             if (resultCode == RESULT_OK) {
-                mMediaProjection = mMediaProjectionManager.getMediaProjection(resultCode, data);
+                mmpCode = resultCode;
+                mmpData = data;
 
                 Runnable sEncoding = new recordingClass();
                 Thread sThread = new Thread(sEncoding);
                 sThread.start();
-
             } else {
                 // user did not grant permissions
             }
@@ -120,8 +128,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private static final String VIDEO_MIME_TYPE = "video/avc";
-    private static int VIDEO_WIDTH = 1080;
-    private static int VIDEO_HEIGHT = 1920;
+    private static int VIDEO_WIDTH;
+    private static int VIDEO_HEIGHT;
 
     private Surface mInputSurface;
     private MediaCodec mVideoEncoder;
@@ -144,31 +152,52 @@ public class MainActivity extends AppCompatActivity {
         public void run() {
             handlerThread.start();
             mDrainHandler = new Handler(handlerThread.getLooper());
+            boolean first = true;
 
-            DisplayManager dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
-            Display defaultDisplay = dm.getDisplay(Display.DEFAULT_DISPLAY);
-            if (defaultDisplay == null) {
-                throw new RuntimeException("No display found.");
+            while (true) {
+                Utils.sleep(100);
+
+                if (!first && !restartEncoding)
+                    continue;
+
+                restartEncoding = false;
+                first = false;
+
+                DisplayManager dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                Display defaultDisplay = dm.getDisplay(Display.DEFAULT_DISPLAY);
+                if (defaultDisplay == null) {
+                    throw new RuntimeException("No display found.");
+                }
+
+                // Get the display size and density.
+                DisplayMetrics metrics = getResources().getDisplayMetrics();
+
+                windowManager = getWindowManager();
+                Point size = new Point();
+                windowManager.getDefaultDisplay().getRealSize(size);
+                VIDEO_WIDTH = size.x;
+                VIDEO_HEIGHT = size.y;
+                dispSize = size.x << 1 + size.y;
+
+//            VIDEO_WIDTH = 1080;//metrics.widthPixels;
+//            VIDEO_HEIGHT = 1920;//metrics.heightPixels;
+                int screenDensity = metrics.densityDpi;
+
+                prepareVideoEncoder();
+
+                Log.e(Encoder.APP_NAME, "Width: " + VIDEO_WIDTH + ", height: " + VIDEO_HEIGHT);
+
+                // Start the video input.
+                mMediaProjection = mMediaProjectionManager.getMediaProjection(mmpCode, mmpData);
+                mMediaProjection.createVirtualDisplay("Recording Display",
+                        VIDEO_WIDTH,
+                        VIDEO_HEIGHT,
+                        screenDensity, DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION /* flags */, mInputSurface,
+                        null /* callback */, null /* handler */);
+
+                // Start the encoders
+                drainEncoder();
             }
-            prepareVideoEncoder();
-
-            // Get the display size and density.
-            DisplayMetrics metrics = getResources().getDisplayMetrics();
-            VIDEO_WIDTH = 1080;//metrics.widthPixels;
-            VIDEO_HEIGHT = 1920;//metrics.heightPixels;
-            int screenDensity = metrics.densityDpi;
-
-            Log.e(Encoder.APP_NAME, "Width: " + VIDEO_WIDTH + ", height: " + VIDEO_HEIGHT);
-
-            // Start the video input.
-            mMediaProjection.createVirtualDisplay("Recording Display",
-                    VIDEO_WIDTH,
-                    VIDEO_HEIGHT,
-                    screenDensity, 0 /* flags */, mInputSurface,
-                    null /* callback */, null /* handler */);
-
-            // Start the encoders
-            drainEncoder();
         }
     }
 
@@ -184,15 +213,21 @@ public class MainActivity extends AppCompatActivity {
         format.setString(MediaFormat.KEY_MIME, "video/avc");
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, 15000000); // 6Mbps
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 20000000); // 20Mbps
         format.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate);
         //format.setInteger(MediaFormat.KEY_CAPTURE_RATE, frameRate);
         format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 1);
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, -10); // 1 seconds between I-frames
 //        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 10); // 1 seconds between I-frames
         format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, MICROSECONDS_IN_ONE_SECOND * REPEAT_FRAME_DELAY / frameRate); // µs
+        format.setInteger(MediaFormat.KEY_WIDTH, VIDEO_WIDTH);
+        format.setInteger(MediaFormat.KEY_HEIGHT, VIDEO_HEIGHT);
 //        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
 //            format.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE);
+
+//        format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
+//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+//            format.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42);
 
         // Create a MediaCodec encoder and configure it. Get a Surface we can use for recording into.
         try {
@@ -206,10 +241,24 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private boolean drainEncoder() {
+        int res, bufferIndex;
+        Point size = new Point();
         mDrainHandler.removeCallbacks(mDrainEncoderRunnable);
 
         while (true) {
-            int bufferIndex = mVideoEncoder.dequeueOutputBuffer(mVideoBufferInfo, 0);
+            windowManager.getDefaultDisplay().getRealSize(size);
+            res = size.x << 1 + size.y;
+
+//            Log.e(Encoder.APP_NAME, "x: " + size.x + ", y: " + size.y);
+            if (res != dispSize) {
+                Log.e(Encoder.APP_NAME, "Size changed, restarting encoder");
+                dispSize = res;
+                restartEncoding = true;
+                releaseEncoders();
+                return false;
+            }
+
+            bufferIndex = mVideoEncoder.dequeueOutputBuffer(mVideoBufferInfo, 0);
 
             if (bufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 // nothing available yet
@@ -229,7 +278,7 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 //writeFrameMeta(mVideoBufferInfo, encodedData.remaining());
-                Log.e(Encoder.APP_NAME, "Streaming");
+//                Log.e(Encoder.APP_NAME, "Streaming");
                 writeFully(encodedData);
 
                 mVideoEncoder.releaseOutputBuffer(bufferIndex, false);
@@ -275,18 +324,18 @@ public class MainActivity extends AppCompatActivity {
         mDrainHandler.removeCallbacks(mDrainEncoderRunnable);
         if (mVideoEncoder != null) {
             mVideoEncoder.stop();
+            if (mInputSurface != null) {
+                mInputSurface.release();
+                mInputSurface = null;
+            }
             mVideoEncoder.release();
             mVideoEncoder = null;
-        }
-        if (mInputSurface != null) {
-            mInputSurface.release();
-            mInputSurface = null;
         }
         if (mMediaProjection != null) {
             mMediaProjection.stop();
             mMediaProjection = null;
         }
-        mVideoBufferInfo = null;
-        mDrainEncoderRunnable = null;
+//        mVideoBufferInfo = null;
+//        mDrainEncoderRunnable = null;
     }
 }
